@@ -7,6 +7,7 @@ import (
 	"errors"
 	"slices"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -442,6 +443,30 @@ func TestGetPrioritizedJobsForConsumer(t *testing.T) {
 		assert.True(t, sort.SliceIsSorted(rJobs, func(i, j int) bool {
 			return rJobs[i].Message.Priority > rJobs[j].Message.Priority
 		}))
+	})
+	// Regression guard: the ACTUAL query used by GetPrioritizedJobsForConsumer
+	// (prioritizedJobsForConsumerQuery) must be served by the job_consumer_status_priority
+	// index (migration 000013) with no filesort. Without it the DB filesorts the whole QUEUED
+	// backlog -> O(backlog) latency -> 504 for busy consumers. This binds to the real query
+	// const, so reverting `=` back to `like` (which filesorts) fails the test. Runs against the
+	// SQLite test DB; SQLite reports a filesort as "USE TEMP B-TREE FOR ORDER BY".
+	t.Run("UsesPrioritizedIndexNoFilesort", func(t *testing.T) {
+		query := "EXPLAIN QUERY PLAN " + prioritizedJobsForConsumerQuery
+		rows, err := testDB.Query(query, testJob.Listener.ID.String(), data.JobQueued, 25)
+		assert.NoError(t, err)
+		defer rows.Close()
+		var plan strings.Builder
+		for rows.Next() {
+			var id, parent, notused int
+			var detail string
+			assert.NoError(t, rows.Scan(&id, &parent, &notused, &detail))
+			plan.WriteString(detail)
+			plan.WriteString("\n")
+		}
+		assert.NoError(t, rows.Err())
+		planStr := plan.String()
+		assert.Contains(t, planStr, "job_consumer_status_priority", "query should use the prioritized index; plan was:\n"+planStr)
+		assert.NotContains(t, planStr, "USE TEMP B-TREE FOR ORDER BY", "query should not filesort; plan was:\n"+planStr)
 	})
 }
 

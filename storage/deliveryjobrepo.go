@@ -276,11 +276,17 @@ func (djRepo *DeliveryJobDBRepository) GetJobsForConsumer(consumer *data.Consume
 	return djRepo.getJobs(baseQuery, nil, consumer, appendWithPaginationArgs(page, consumer.ID.String(), jobStatus))
 }
 
+// prioritizedJobsForConsumerQuery backs GetPrioritizedJobsForConsumer (and its plan
+// regression test). It uses `=` (not `like`) on consumerId so the equality lets the DB
+// satisfy the ORDER BY from the job_consumer_status_priority index (migration 000013)
+// instead of filesorting the consumer's entire QUEUED backlog -> O(backlog) latency ->
+// 504 for busy consumers. A `like` on the leading column is treated as a range, which
+// defeats the index-ordered sort. consumerId is always an exact xid, so `=` is equivalent.
+const prioritizedJobsForConsumerQuery = jobCommonSelectQuery + " consumerId = ? AND status = ? ORDER BY priority DESC, createdAt DESC, id DESC LIMIT ?"
+
 // GetPrioritizedJobsForConsumer retrieves DeliveryJob created for delivery to a customer and it has to be filtered by a specific status and ordered by message priority
 func (djRepo *DeliveryJobDBRepository) GetPrioritizedJobsForConsumer(consumer *data.Consumer, jobStatus data.JobStatus, pageSize int) ([]*data.DeliveryJob, error) {
-	orderClause := "ORDER BY priority DESC, createdAt DESC, id DESC"
-	baseQuery := jobCommonSelectQuery + " consumerId like ? AND status = ? " + orderClause + " LIMIT ?"
-	jobs, _, err := djRepo.getJobs(baseQuery, nil, consumer, args2SliceFnWrapper(consumer.ID.String(), jobStatus, pageSize)())
+	jobs, _, err := djRepo.getJobs(prioritizedJobsForConsumerQuery, nil, consumer, args2SliceFnWrapper(consumer.ID.String(), jobStatus, pageSize)())
 	return jobs, err
 }
 
