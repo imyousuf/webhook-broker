@@ -20,6 +20,11 @@ const (
 // MessageDispatcher is the contract for dispatching message
 type MessageDispatcher interface {
 	Dispatch(message *data.Message)
+	// EnqueueJobs puts QUEUED push jobs into this node's in-memory queue; jobs of consumers that are paused (per the
+	// pause snapshot) are re-parked instead. Returns the number of jobs enqueued.
+	EnqueueJobs(jobs []*data.DeliveryJob) int
+	// QueueDepth returns the number of jobs waiting in this node's in-memory queues
+	QueueDepth() int
 	Stop()
 }
 
@@ -41,6 +46,9 @@ type MessageDispatcherImpl struct {
 	jobRecoverStaleInflightWorkerStop chan bool
 	jobRecoverRetryWorkerStop         chan bool
 	recoveryWorkersEnabled            bool
+	pauseRegistry                     PauseRegistry
+	jobParkingRepo                    storage.JobParkingRepository
+	metrics                           *MetricsContainer
 }
 
 // Dispatch is responsible for dispatching delivery jobs for the message
@@ -49,10 +57,15 @@ func (msgDispatcher *MessageDispatcherImpl) Dispatch(message *data.Message) {
 		return
 	}
 	jobs, err := createJobs(msgDispatcher, message)
+	var parkedJobs []*data.DeliveryJob
 	if err == nil {
-		err = msgDispatcher.djRepo.DispatchMessage(message, jobs...)
+		jobs, parkedJobs = splitPausedJobs(msgDispatcher, jobs)
+		err = msgDispatcher.djRepo.DispatchMessageWithParking(message, jobs, parkedJobs)
 	}
 	if err == nil {
+		if len(parkedJobs) > 0 {
+			msgDispatcher.metrics.ParkedJobsTotal.WithLabelValues(ParkReasonDispatch).Add(float64(len(parkedJobs)))
+		}
 		for _, job := range jobs {
 			queueJob(msgDispatcher, job)
 		}
@@ -96,10 +109,44 @@ var (
 		return jobs, err
 	}
 
-	queueJob = func(msgDispatcher *MessageDispatcherImpl, job *data.DeliveryJob) {
-		if job.Listener.Type == data.PushConsumer {
-			msgDispatcher.jobQueue <- NewJob(job)
+	// splitPausedJobs separates jobs of consumers that are effectively paused (per this node's snapshot); those are
+	// parked in the same transaction that dispatches the message
+	splitPausedJobs = func(msgDispatcher *MessageDispatcherImpl, jobs []*data.DeliveryJob) (active, parked []*data.DeliveryJob) {
+		active = make([]*data.DeliveryJob, 0, len(jobs))
+		for _, job := range jobs {
+			if msgDispatcher.pauseRegistry.IsEffectivelyPaused(job.Listener.ID.String()) {
+				parked = append(parked, job)
+			} else {
+				active = append(active, job)
+			}
 		}
+		return active, parked
+	}
+
+	// queueJob puts a push job in the in-memory queue, unless the pause snapshot says its consumer is paused, in
+	// which case the job is re-parked (the re-park itself is conditional on the pause existing in the database)
+	queueJob = func(msgDispatcher *MessageDispatcherImpl, job *data.DeliveryJob) {
+		if job.Listener.Type != data.PushConsumer {
+			return
+		}
+		if msgDispatcher.pauseRegistry.IsEffectivelyPaused(job.Listener.ID.String()) {
+			reparkJob(msgDispatcher.jobParkingRepo, msgDispatcher.metrics, job, ParkReasonRetry)
+			return
+		}
+		msgDispatcher.jobQueue <- NewJob(job)
+	}
+
+	// reparkJob moves a QUEUED job to parking if its consumer is effectively paused in the database; returns true if moved
+	reparkJob = func(jobParkingRepo storage.JobParkingRepository, metrics *MetricsContainer, job *data.DeliveryJob, reason string) bool {
+		moved, err := jobParkingRepo.ReparkQueuedJob(job)
+		if err != nil {
+			log.Error().Err(err).Str("jobId", job.ID.String()).Msg("error - could not re-park job of paused consumer")
+			return false
+		}
+		if moved {
+			metrics.ParkedJobsTotal.WithLabelValues(reason).Inc()
+		}
+		return moved
 	}
 
 	genericPanicRecoveryFunc = func() {
@@ -251,6 +298,29 @@ func (msgDispatcher *MessageDispatcherImpl) StartDispatcher() {
 	}
 }
 
+// EnqueueJobs puts QUEUED push jobs into this node's in-memory queue; jobs of consumers paused per the snapshot
+// are re-parked instead. Returns the number of jobs enqueued.
+func (msgDispatcher *MessageDispatcherImpl) EnqueueJobs(jobs []*data.DeliveryJob) int {
+	enqueued := 0
+	for _, job := range jobs {
+		if job == nil || job.Listener == nil || job.Listener.Type != data.PushConsumer {
+			continue
+		}
+		if msgDispatcher.pauseRegistry.IsEffectivelyPaused(job.Listener.ID.String()) {
+			reparkJob(msgDispatcher.jobParkingRepo, msgDispatcher.metrics, job, ParkReasonHandoff)
+			continue
+		}
+		msgDispatcher.jobQueue <- NewJob(job)
+		enqueued++
+	}
+	return enqueued
+}
+
+// QueueDepth returns the number of jobs waiting in this node's in-memory queues
+func (msgDispatcher *MessageDispatcherImpl) QueueDepth() int {
+	return len(msgDispatcher.jobQueue) + msgDispatcher.jobPriorityQueue.Len()
+}
+
 // Stop stops the workers of the dispatcher
 func (msgDispatcher *MessageDispatcherImpl) Stop() {
 	timeoutContext, cancelFunc := context.WithTimeout(context.Background(), msgDispatcher.stopTimeout)
@@ -315,6 +385,8 @@ type Configuration struct {
 	BrokerConfig             config.BrokerConfig
 	ConsumerConnectionConfig config.ConsumerConnectionConfig
 	MetricsCollector         *MetricsContainer
+	PauseRegistry            PauseRegistry
+	JobParkingRepo           storage.JobParkingRepository
 }
 
 // NewMessageDispatcher retrieves new instance of MessageDispatcher
@@ -323,6 +395,9 @@ func NewMessageDispatcher(configuration *Configuration) MessageDispatcher {
 		panic(panicString)
 	}
 	if configuration.BrokerConfig == nil || configuration.ConsumerConnectionConfig == nil {
+		panic(panicString)
+	}
+	if configuration.PauseRegistry == nil || configuration.JobParkingRepo == nil || configuration.MetricsCollector == nil {
 		panic(panicString)
 	}
 	brokerConfig := configuration.BrokerConfig
@@ -335,10 +410,11 @@ func NewMessageDispatcher(configuration *Configuration) MessageDispatcher {
 		workerPool: make(chan chan *Job, brokerConfig.GetMaxWorkers()), jobPriorityQueue: NewJobPriorityQueue(configuration.MetricsCollector.QueuedJobCount),
 		messageRecoverWorkerStop: make(chan bool), jobQueue: make(chan *Job, brokerConfig.GetMaxMessageQueueSize()),
 		rationalDelay: brokerConfig.GetRationalDelay(), lockRepo: lockRepo, recoveryWorkersEnabled: brokerConfig.IsRecoveryWorkersEnabled(),
-		jobRecoverStaleInflightWorkerStop: make(chan bool), jobRecoverRetryWorkerStop: make(chan bool), brokerConfig: brokerConfig}
+		jobRecoverStaleInflightWorkerStop: make(chan bool), jobRecoverRetryWorkerStop: make(chan bool), brokerConfig: brokerConfig,
+		pauseRegistry: configuration.PauseRegistry, jobParkingRepo: configuration.JobParkingRepo, metrics: configuration.MetricsCollector}
 	workers := make([]*Worker, brokerConfig.GetMaxWorkers())
 	for i := 0; i < len(workers); i++ {
-		worker := NewWorker(dispatcherImpl.workerPool, consumerConfig, brokerConfig, djRepo)
+		worker := NewWorker(dispatcherImpl.workerPool, consumerConfig, brokerConfig, djRepo, configuration.JobParkingRepo, configuration.MetricsCollector)
 		worker.Start()
 		workers[i] = &worker
 	}

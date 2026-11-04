@@ -191,7 +191,13 @@ func getCompleteDispatcherConfiguration(msgRepo storage.MessageRepository, djRep
 		LockRepo:                 lockRepo,
 		MsgRepo:                  msgRepo,
 		MetricsCollector:         counter,
+		PauseRegistry:            getTestPauseRegistry(),
+		JobParkingRepo:           dataAccessor.GetJobParkingRepository(),
 	}
+}
+
+func getTestPauseRegistry() PauseRegistry {
+	return NewPauseRegistry(dataAccessor.GetDispatchPauseRepository(), dataAccessor.GetConsumerRepository(), configuration, counter)
 }
 
 func getDispatcherConfiguration(djRepo storage.DeliveryJobRepository, consumerRepo storage.ConsumerRepository, brokerConfig config.BrokerConfig, consumerConfig config.ConsumerConnectionConfig, lockRepo storage.LockRepository) *Configuration {
